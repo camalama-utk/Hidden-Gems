@@ -1,0 +1,562 @@
+---
+title: "Movie Recommendation Case Statement"
+author: "You"
+date: "Fall 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(arules)
+library(tidyverse)
+```
+
+##Case Background
+
+Who doesn't like discovering new movies to watch?  Even better if you end up really enjoying the movie!  Even *better* if it's a relatively obscure movie that you then get to tell your friends about and encourage them to watch.
+
+Music streaming services like Pandora "pick" songs for you based on what it anticipates to be songs you would potentially like, then throws in some bizarre choices every now and then because "you never know".   Netflix, amazon, etc., have developed recommendation engines that take your viewing and rating history and suggest new songs/shows/movies/products that you might like.
+
+In fact, many places do this, and for products as well.   For instance, amazon.com has a "Frequently Bought Together", imdb.com has a "People who liked this also liked...", Netflix has a "More like this", Bestbuy has a "Customers who viewed this item also viewed", Walmart.com has a "Customers also considered" section to all of their product pages. 
+
+However, movie streaming services like Netflix do not appear to have yet developed a recommendation engine with the aim of giving you "obscure" suggestions.  Let's take a stab at it!
+
+
+##Data
+
+The data we will use comes from `https://grouplens.org/datasets/movielens/`, more specifically their "MovieLens Tag Genome Dataset 2021".  This dataset was released December 2021 and contains user ratings up through early 2021 (though it seems there are relatively few ratings for movies for movies 2019 and later). 
+
+The datasets from this collection that are relevant to us have been acquired and put inside the saved R environment `Movies-RawData.RData`.
+
+* `META`:  title, item_id (internal ID for movie), and avgRating (from imdb)
+* `RATINGS`:  item_id (internal ID for movie), user_id, rating (0.5 to 5; kind of like 1 to 10 stars)
+
+```{r reading in data}
+load("Movies-RawData.RData")
+```
+
+By setting up the data appropriately, we can perform a "market basket analysis" to determine what combinations of movies are often enjoyed by the same viewer. 
+
+* Each user is a "shopping cart"
+* The movies that user has enjoyed are the "items in the cart"
+
+The standard market basket toolbox in `arules` can then be used to make recommendations, filtered on criteria we have in mind (obscure movies, but high confidence). Perhaps association rules exist like "If a viewer likes The Usual Suspects and Avatar, then they will also like Mission Impossible with a high degree of confidence".
+
+The first decision we have to make is "what counts as being in the cart?".  Since we're after identifying movies that users like, perhaps we can consider a movie to be "in the cart" if the user gives it a rating of at least 4, or maybe at least 4.5, or if we're really strict, just 5.0.  For the purposes of this case and grading, we'll use 4.5 (sanity checks for this case will be built using this definition), though if you want to remake this app on your own time you can play around with other thresholds!
+
+## Step-by-step conversion of original data into something we can use for market basket analysis
+
+Let's begin by creating some meta-data that records how many people have seen each movie (we're after obscure movies after all).
+
+* We'll start by creating a dataframe named `POPULARITY` that records the number of people who have seen each movie. We'll use the `aggregate` function the formula `user_id ~ item_id` on the `RATINGS` data.
+
+* Since we will be making recommendations, enough people need to have rated the movie for us to be confident in the recommendations.  Let's consider movies that at least 4 people have seen!
+
+* From now on, instead of keeping track of the number of people who have rated a movie, we'll keep track of the *percent* of users who have rated a movie.  Let's represent this as a number between 0-100, rounded to two decimals.
+
+* To get the movie's name and imdb rating, let's merge `META` into `POPULARITY` by `item_id`, left-arrowing the merge back into `POPULARITY` so that, in effect, the title and rating gets added to `POPULARITY`.  Let's NULL out item_id, which is no longer needed.
+
+* Finally, let's add a column for the year of the movie (maybe we want to filter out "old" movies).  Some fancy text mining code from the `stringr` library can help us extract out the year from the movie title.
+
+```{r POPULARITY}
+#Start by making a dataframe POPULARITY that counts up the number of people who have seen each movie
+POPULARITY <- RATINGS %>% group_by(item_id) %>% summarize( n_distinct(user_id) )
+head(POPULARITY)
+#   item_id user_id
+# 1       1   66593
+# 2       2   27045
+# 3       3   15485
+# 4       4    2992
+# 5       5   15383
+# 6       6   28515
+names(POPULARITY) <- c("item_id","n_raters")
+POPULARITY %>% head()
+#Only consider movies that have been seen by at least 4 people
+POPULARITY <- POPULARITY %>% filter(n_raters>=4) 
+
+#Lets consider % of people who have seen a movie instead of the raw count
+#Get number of people in dataset
+npeople <- n_distinct(RATINGS$user_id)
+#Change column name to reflect its contents
+names( POPULARITY )[2] <- "PercentSeen"
+#Calculate the percent of people who have seen each movie
+POPULARITY <- POPULARITY %>% mutate(PercentSeen = round( 100*POPULARITY$PercentSeen/npeople, digits=2 ) )
+
+
+
+#Add title and imdb rating into POPULARITY, change column name to reflect ratings origin
+POPULARITY <-  POPULARITY %>% left_join(
+  META,
+  by = c("item_id"="item_id")
+) 
+names(POPULARITY)[4] <- "imdbRating"
+POPULARITY <- POPULARITY %>% mutate(imdbRating = round(imdbRating,digits=2) )
+head(POPULARITY)
+# # A tibble: 6 × 4
+#   item_id PercentSeen title                              imdbRating
+#     <int>       <dbl> <chr>                                   <dbl>
+# 1       1       26.9  Toy Story (1995)                         3.89
+# 2       2       10.9  Jumanji (1995)                           3.27
+# 3       3        6.26 Grumpier Old Men (1995)                  3.17
+# 4       4        1.21 Waiting to Exhale (1995)                 2.87
+# 5       5        6.22 Father of the Bride Part II (1995)       3.08
+# 6       6       11.5  Heat (1995)                              3.86
+
+#Add the Year of the movie as a column here (even though it is built into the title)
+library(stringr)
+x <- str_extract(POPULARITY$title,"\\([0-9][0-9][0-9][0-9]\\)")
+table(x)
+year <- as.numeric(gsub("\\)","",gsub("\\(","",x)) )
+POPULARITY$Year <-year
+
+
+#Remove item_id, it's not needed since we have the movie title
+POPULARITY$item_id <- NULL
+```
+
+
+Now let's work with the `RATINGS` data to get it into a form that allows market basket analysis.
+
+* Create a dataframe named `SUB` that is a subset of `RATINGS` that contains ratings of 4.5 or larger.  You should find this subset has 6599019 rows.  This dataframe has user_id (i.e., cart number), item_id (i.e., movie id and item that's in cart), rating (all 4.5 and above; not needed anymore).
+
+* Merge `META` into `SUB` by `item_id`, calling the result `SUB` (in effect, this adds title and imdb rating to SUB)
+
+* Let's ensure that only user's who have rated at least 2 movies are considered (after all, recommendations of the form "if you like this movie, you might also like that movie" requires people to have rated at least 2 movies!).  It may be the case that throwing away some of these single-movie users makes the number of times a movie has been rated dip below 4, so we'll iterate so that the movies we consider have been rated at least 4 times and each user has seen at least 2 movies.  `SUB` now contains 6538268 rows.
+
+* Let's update `POPULARITY` so that only the surviving set of movies are in this dataframe (kick out the movies that are now never rated by users in the `SUB` dataframe)
+
+* Let's define a dataframe called `CARTS` that looks a transactional dataset by making a copy of `SUB`, then renaming the `user_id` column to be `transactionID` and the `title` column to be `item`.  We can NULL out of the `item_id`, `rating`, and `avgRating` since they aren't relevant things to keep track of in a shopping cart.
+
+* Verify the sanity checks for specific rows
+
+* Create a `TRANS` transactional object 
+
+* "Save" `POPULARITY` and `TRANS` to an .RData file so we don't have to do this processing again!
+
+```{r reworking RATINGS}
+#Frequency table of ratings; 4.5 seems like a good cutoff because there are a LOT
+#of movies rated 4 (most movies are good)
+barplot( table(RATINGS$rating) )
+round( 100*table(RATINGS$rating)/nrow(RATINGS),digits=1 )
+ # 0.5    1  1.5    2  2.5    3  3.5    4  4.5    5 
+ # 1.6  3.2  1.6  6.6  5.0 19.8 12.5 26.5  8.6 14.6 
+
+SUB <- RATINGS %>% filter(rating>=4.5)
+nrow(SUB)  #6599019
+
+SUB <- SUB %>% inner_join(META, by = c("item_id"="item_id") )
+
+
+#Consider only users who have rated at least 2 movies; and re-inforce that each movie
+#has been rated at least 4 times
+r <-1
+while( min(table(SUB$user_id))==1 | min(table(SUB$item_id)) < 4 ) {
+  cat(paste("Round",r,"with", nrow(SUB),"rows\n"))
+  USER <- table(SUB$user_id)
+  good.users <- names(USER)[which(USER>=2)]
+  SUB <- SUB %>% filter(user_id %in% good.users)
+  TAB <- table(SUB$item_id)
+  good.movies <- names(TAB)[which(TAB>=4)]
+  SUB <- SUB %>% filter(item_id %in% good.movies)
+  r<-r+1
+}
+nrow(SUB) #6538268
+
+#Update the POPULARITY dataframe to reflect the titles that indeed have been rated at least 4 times
+POPULARITY <- POPULARITY %>% filter(title %in% unique(SUB$title) )
+tail(POPULARITY)
+# A tibble: 6 × 4
+#   PercentSeen title                                                imdbRating  Year
+#         <dbl> <chr>                                                     <dbl> <dbl>
+# 1        0.02 Ma Rainey's Black Bottom (2020)                            3.61  2020
+# 2        0.01 One Night in Miami... (2020)                               3.42  2020
+# 3        0.03 Happiest Season (2020)                                     3.29  2020
+# 4        0.01 Black Bear (2020)                                          3.5   2020
+# 5        0    The Bee Gees: How Can You Mend a Broken Heart (2020)       3.97  2020
+# 6        0.03 Death to 2020 (2020)                                       3.2   2020
+
+#Make a dataframe with userID and title
+CARTS <- SUB
+head(CARTS)
+CARTS$item_id <- NULL
+CARTS$rating <- NULL
+CARTS$avgRating <- NULL
+names(CARTS) <- c("transactionID","item")
+
+
+#Check out what user 2920 has in their cart
+CARTS[ which(CARTS$transactionID==2920), ]
+#       transactionID                                                                           item
+# 79085            2920                                                       Leaving Las Vegas (1995)
+# 103477           2920                                      Twelve Monkeys (a.k.a. 12 Monkeys) (1995)
+# 282637           2920                                                           Birdcage, The (1996)
+# 333313           2920                                                                 Jeffrey (1995)
+# 336355           2920                                                      Living in Oblivion (1995)
+# 448476           2920                                                      Little Princess, A (1995)
+# 534289           2920                                                            Pulp Fiction (1994)
+# 609373           2920                                               Shawshank Redemption, The (1994)
+# 783137           2920                                                                    Dave (1993)
+# 817272           2920                                                    Hudsucker Proxy, The (1994)
+# 943727           2920                                                            Blade Runner (1982)
+# 959858           2920                                         Nightmare Before Christmas, The (1993)
+# 1120358          2920                                                                   Fargo (1996)
+# 1158624          2920                                 Mystery Science Theater 3000: The Movie (1996)
+# 1332701          2920                                                                 Vertigo (1958)
+# 1342091          2920                                                             Rear Window (1954)
+# 1356572          2920                                                      North by Northwest (1959)
+# 1388386          2920                                                     Maltese Falcon, The (1941)
+# 1429306          2920                                                            Citizen Kane (1941)
+# 1497913          2920                                                Escape to Witch Mountain (1975)
+# 1536246          2920                                                                Die Hard (1988)
+# 1565698          2920                                     Willy Wonka & the Chocolate Factory (1971)
+# 1604274          2920                                                          Reservoir Dogs (1992)
+# 1653311          2920                                                          Drop Dead Fred (1991)
+# 1674855          2920                                         Monty Python and the Holy Grail (1975)
+# 1732217          2920                                         One Flew Over the Cuckoo's Nest (1975)
+# 1816568          2920 Raiders of the Lost Ark (Indiana Jones and the Raiders of the Lost Ark) (1981)
+# 1857528          2920                                                            Withnail & I (1987)
+# 1865972          2920                                                            12 Angry Men (1957)
+# 1885423          2920                                                     Clockwork Orange, A (1971)
+# 1891402          2920                                                   To Kill a Mockingbird (1962)
+# 2082160          2920                                                              Sting, The (1973)
+# 2117611          2920                                   Rosencrantz and Guildenstern Are Dead (1990)
+# 2126117          2920                                                      Dead Poets Society (1989)
+# 2209049          2920                                                        Deer Hunter, The (1978)
+# 2233782          2920                                               Manchurian Candidate, The (1962)
+# 2339692          2920                                                     Room with a View, A (1986)
+# 2393683          2920                                                Star Trek: First Contact (1996)
+
+
+#Sanity check 
+
+(CARTS[order(CARTS$transactionID),])[c(10,100,1000,10000,50000,100000),]
+#         transactionID                                                  item
+# 4944513             0 Star Wars: Episode V - The Empire Strikes Back (1980)
+# 2732693            25                                          Fargo (1996)
+# 638864            144 Shoot the Piano Player (Tirez sur le pianiste) (1960)
+# 3350568          1268                             Da Vinci Code, The (2006)
+# 593869           7301          Austin Powers: The Spy Who Shagged Me (1999)
+# 6001552         14865                Monty Python and the Holy Grail (1975)
+length(unique(CARTS$transactionID))  #should be 210919
+length(unique(CARTS$item)) #should be 17146
+
+
+#Create transactional object
+library(arules)
+TRANS <- as(split(CARTS$item, CARTS$transactionID), "transactions")
+#Warning about removing duplicates is fine; some users rated the same movie more than once
+#so it's just throwing those instances out.
+
+#Look at the items that the 2nd "cart" contains.  This turns out to be the person with userID of 7
+inspect(TRANS[2])
+#    items                                                        transactionID
+#[1] {Last of the Mohicans, The (1992),                                        
+#     Lord of the Rings: The Fellowship of the Ring, The (2001),               
+#     Shrek (2001),                                                            
+#     South Park: Bigger, Longer and Uncut (1999)}                7
+
+
+summary(TRANS)  #Key details about the data in transactional form; see most commonly liked movies, size distribution of carts (someone has rated 2133 movies)
+
+```
+
+Based on the way we defined "in the cart", there are a total of 210919 transactions (people) each of which contains one or more of 17146 unique items (movies) in their cart.  Let's see what we can learn about viewing habits!
+
+Since these data files are big and take a while to read in, let's create a saved environment file (.RData) to "save" our work.  We'll be able to load back in the .RData file we create so we don't have to redo all the data manipulation again.
+
+We can use the `save` function to save both the dataframes (`POPULARITY` and `TRANS`) for easy use in the shiny app.  `save(POPULARITY,TRANS,file="MOVIERECSpring2023.RData")`
+
+
+```{r save work}
+#SAVE OUR WORK!
+save(POPULARITY,TRANS,file="MOVIERECFall2023.RData")
+```
+
+
+The `MOVIERECFall2023.RData` saved environment now contains everything you need for the Shiny app.  Let's play around with the data just a little.
+
+
+
+
+##Exploration of some properties of the data
+
+It's always nice to survey the landscape of the data before diving into the actual analytics.
+
+* Top 20 most commonly liked movies.  Bottom 20 most commonly liked movies only appear once in the data.
+
+```{r common}
+rm(list=ls())
+load("MOVIERECFall2023.RData")
+
+#20 movies most and least commonly liked
+#For the least commonly liked, either they are terrible, or just really obscure
+#itemFrequency is the fraction (0-1) of transactions that have an item, so multiplying it by length(TRANS)
+#gives you the total number of times that item appeared in the data
+head( sort( itemFrequency(TRANS), decreasing = TRUE), 5 )
+head( sort( itemFrequency(TRANS)*length(TRANS), decreasing = TRUE), 20 )
+tail( sort( itemFrequency(TRANS)*length(TRANS), decreasing = TRUE), 20 )
+
+
+#Querying a particular movie whose name you know (11.6% of people liked Fargo)
+itemFrequency(TRANS)["Fargo (1996)"]
+
+#Can use square brackets too, but it's not like you'll know the number associated with a movie
+itemFrequency(TRANS)[10000]
+
+#Querying a movie whose name you don't know (e.g. all moves with Matrix in it)
+itemFrequency(TRANS)[grep("Matrix",itemLabels(TRANS))]
+itemFrequency(TRANS)[grep("Skywalk",itemLabels(TRANS))]
+itemFrequency(TRANS)[grep("Mids",itemLabels(TRANS))]
+itemFrequency(TRANS)[grep("Fargo",itemLabels(TRANS))]
+itemFrequency(TRANS)[grep("Trans",itemLabels(TRANS))]
+```
+
+* The Last Unicorn is an animated movie I loved as a kid.  Is it in the data?  If so, in how many carts?
+
+```{r common}
+#See if the word unicorn appears anywhere in titles; 
+#grep tells you position in a vector that matches a text string
+grep("Unicorn", itemLabels(TRANS) )
+itemLabels(TRANS)[ grep("Unicorn", itemLabels(TRANS) ) ]  #same as itemLabels(TRANS)[6554]
+itemFrequency(TRANS)["Last Unicorn, The (1982)"]  #fraction of carts containing item
+itemFrequency(TRANS)["Last Unicorn, The (1982)"]*length(TRANS)  #number of carts containing item
+
+```
+
+* Some movies I like off the top of my head are in the following two lists of 9 movies.  Is anyone else like me and has *EVERY* item in this list?
+
+```{r my likes}
+movies <- c("Hereditary (2018)","Bridesmaids (2011)","Clue (1985)",
+           "Devil Wears Prada, The (2006)","Mulholland Drive (2001)",
+           "Kill Bill: Vol. 1 (2003)","Kill Bill: Vol. 2 (2004)",
+           "Memento (2000)", "Midsommar (2019)")
+SUBSET <- TRANS[ which(TRANS %ain% movies) ]  # %ain% means EVERY items has to be in the cart
+length(SUBSET)  #no "clones" of me in the dataset; no other cart has these 9 items in it
+
+#What about this set of movies...all "weird" movies?
+movies <- c("Mulholland Drive (2001)", "Memento (2000)", "Inception (2010)", "Donnie Darko (2001)",
+           "Black Swan (2010)","Primer (2004)","Game, The (1997)","Cube (1997)","Creep (2014)")
+SUBSET <- TRANS[ which(TRANS %ain% movies) ]
+length(SUBSET)  #1;  there's 1 other user who has this exact set of movies (and more) in their list of likes
+inspect(SUBSET[1])   #This dude liked a LOT of movies; not a bad reference list!
+```
+
+
+
+
+****************************************************************************************
+****************************************************************************************
+****************************************************************************************
+
+## Start here for building of recommendation engine!
+
+****************************************************************************************
+****************************************************************************************
+****************************************************************************************
+
+
+
+## Developing recommendations (template for app)
+
+Let's develop a set of recommendations for the set of liked movies in the last chunk.  Since debugging a Shiny app is hard, it's best to anticipate what inputs the app will have, then work through an example by hand of how the app should work.  A powerful way to do this is the define a list object named `input` (since that's what Shiny uses to references what the user selected) and to write code in terms of its elements
+
+```{r}
+#Get this working before you write the Shiny app; it's almost just copy/paste after that
+rm(list=ls())
+load("MOVIERECFall2023.RData")
+
+
+#Create an empty list object
+input <- list()  
+
+#Create an element of "input" named "movies" that contains the list of likes
+#The user will be selecting these from a selectized input box
+input$movies <- c("Mulholland Drive (2001)", "Memento (2000)", "Inception (2010)", 
+                  "Donnie Darko (2001)","Black Swan (2010)","Primer (2004)",
+                  "Triangle (2009)","Midsommar (2019)","Predestination (2014)",
+                  "Game, The (1997)","Cube (1997)","Creep (2014)")
+
+#Create an element of "input" named "number" that contains the (maximum) number of recommendations to make
+#The user will be typing this value in with a numerical input box
+input$number <- 1500
+
+#Create an element of "input" named "confidence" that contains the (minimum) level of confidence
+#of the recommendations.  
+#The user will be selecting this probably with a slider
+input$confidence <- 0.25
+
+#Create an element of "input" named "popularity" that contains the (maximum) popularity
+#of the recommendations, i.e. the percent (0-30) of people in the data that have RATED the movie  
+#The user will be selecting this probably with a slider
+input$popularity <- 0.2  #Only give recommendation if 0.2% or fewer of users have rated the movie
+
+
+#To speed up rule-finding, it's useful to filter out movies we know WILL NOT be recommended
+#because they are "too popular"
+movies.too.popular <- POPULARITY$title[ which(POPULARITY$PercentSeen > input$popularity) ]
+#However, we do need to keep the movies in the data that the user selected, even if they are
+#super popular, since we have to use those to build recommendations! 
+#setdiff(x,y) gives the elements of x that don't also appear in y
+#This 'dont.consider' vector contains movies that are "too popular", except for the ones the
+#user is specifically requesting recommendations to be based off of.
+dont.consider.movies <- setdiff( movies.too.popular , input$movies )  
+
+
+#Let's find rules that apply to at least 4 people, with the input level of confidence
+#minlen=2 ensure rules like if A then Z, if A&B then Z, etc.
+#maxtime=0 ensures it finds all rules
+#none=dont.consider means it will exclude from consideration all moves that are too popular
+#lhs=input$movies means it will only base the "if" statements of the movies based on the
+#movies that the user input
+#default="rhs" is there to preserve the default appearance of the "then" part of the rules
+#control=list(verbose=FALSE) prevents irrelevant, extraneous output to be printed out
+RULES <- apriori(TRANS,parameter = list(supp=4/length(TRANS),conf=input$confidence,minlen=2,maxtime=0),
+                 appearance = list(none=dont.consider.movies,lhs=input$movies,default="rhs"),
+                 control=list(verbose=FALSE)) 
+
+#Do a check
+#If there are no rules, then add a message to the user that says such
+if ( length(RULES) == 0 ) { return( data.frame(message="No recommendations with these parameters.  Add more movies, decrease confidence, or increase popularity!") )  }
+
+#Remove non statistically-significant rules from consideration
+RULES <- RULES[is.significant(RULES,TRANS)]
+
+#Convert rules into a dataframe to allow for easy use
+RULESDF <- DATAFRAME(RULES, separate = TRUE, setStart = '', itemSep = ' + ', setEnd = '')
+
+
+#It may be possible that a rule recommends a movie that the user already likes; filter those out
+#setdiff(x,y) returns the elements of x that do not also appear in y
+#The 'legit.recommendations' will be the ones that engine recommendations that weren't part of 
+#the list of user's movies they input
+legit.recommendations <- setdiff( RULESDF$RHS, input$movies) 
+RULESDF <- RULESDF %>% filter(RHS %in% legit.recommendations)
+
+#Do a check
+#If there are no rows in RULESDF, then add a different message to the user that says such
+if ( nrow(RULESDF) == 0 ) { return( data.frame(message="No recommendations with these parameters.  Add more movies, decrease confidence, or increase popularity!") )  }
+
+
+#For each recommended movie (value in RHS), get the maximum level of confidence to report
+RECS <- RULESDF %>% group_by(RHS) %>% summarize(max(confidence)) 
+
+#Take these recommendations and merge with POPULARITY so that we get information about popularity
+RESULTS <- RECS %>%  left_join(POPULARITY,by=c("RHS"="title"))
+
+#Rename columns to make them more user friendly
+names(RESULTS) <- c("Movie","Confidence","PercentSeen","imdbRating","Year")
+
+#Order the recommendations by confidence
+RESULTS <- RESULTS %>% arrange( desc(Confidence) )
+#Keep only the top "number" recommendations, something the user has input
+#NOTE:  MAKE SURE THIS HAPPENS AFTER SORTING BY CONFIDENCE!!!!
+RESULTS <- RESULTS %>%  head(input$number)
+
+#Before returning, make it so the Movie title is a character instead of a factor
+#Note:  you can't sort alphabetically UNTIL the Movie field is text!
+RESULTS$Movie <- as.character( RESULTS$Movie )
+
+
+#Take out year
+RESULTS$Year <- NULL
+#Take out confusing row names
+row.names(RESULTS) <- NULL
+RESULTS
+
+```
+
+
+********************************************************
+********************************************************
+********************************************************
+
+
+
+## Goals of the Assignment 
+
+Your job is to write a Shiny App that serves as a recommendation engine for "hidden games", obscure movies that only a tiny percentage of user of Movielens have rated.
+
+The following should be UI elements:
+
+* A `selectizeInput` "selectized" drop-down menu allowing users to easily select multiple movies they enjoy.  Additional argument `multiple = TRUE` will be needed.
+
+* A `sliderInput` or `numericInput` where the user inputs the number of desired recommendations from the engine (I'd recommend a max of 100)
+
+* A `sliderInput` or `numericInput` where the user inputs the minimum level of confidence for recommendations.
+
+* A `sliderInput` or `numericInput` where the user inputs the maximum "popularity" of a movie.  The popularity is to be taken as the fraction of users in this data that have rated the movie (not the fraction that has "liked" the movie).  I recommend having these popularities as numbers 0-30 to represent the percentages.
+
+* A "button" to make the recommendation `submitButton("Get recommendations")` as another UI element so that you can make changes to input without having the app try to immediately update.  Doing so requires changing the `server` command to `server <- function(input, output, session) {`  
+
+
+
+
+The following should be produced by the "server":
+
+* A table with 4 columns: the recommended movie, the level of confidence, and the "popularity" of the movie.  Confidence should be a number between 0-100 (rounded to 1 digit after the decimal) instead of a decimal.  PercentSeen should be the same, but rounded to 2 digits after the decimal.
+
+* This table needs to be sorted with the highest confidence recommendations on top by default, but the user should be able to interact with it to sort manually by other fields.  The easiest way to do this is to do a `renderDataTable` in the server.
+
+
+**For Extra Credit** You may add additional UI inputs or server outputs as you deem fit; feel free to get creative!  Ideas:
+
+* Allow the user to constrain results based on imdbRating
+
+* Include a second "selectized" drop-down menu allowing users to EXCLUDE certain movies from recommendations (very useful, since the user likely will put in a couple movies they like, and a lot of the recommendations will be movies they have seen) 
+
+* Allow the user the ability to get recommendations of movies within a particular year range
+
+
+
+Tips for setting up `apriori`:
+
+* For the "selectized" drop-down menu, it's a good idea to trim down the number of possible choices to save time.  There's a total of 17146 movies, and having the list become populated with all of them can be *slow*.  If you have problems with the full list of movies, the following example defines a vector `valid.choices` that is 3530 of the most popular movies, which is likely sufficient.  You can give this vector as the `choices=` for the drop-down menu.
+
+```{r,eval=FALSE}
+valid.choices <- sort( POPULARITY$title[ which(POPULARITY$PercentSeen > 0.5) ] )
+```
+
+
+* Use a minimum support for rules of `supp=0.0000189` (which equals `4/length(TRANS)`) as above, i.e., consider itemsets that appear at least 4 times in the data)
+
+* Remove non-significant rules, but you do NOT need to remove redundant rules (this will happen automatically as you're filtering duplicate recommendations).
+
+********************************************************
+********************************************************
+********************************************************
+
+## Deliverables 
+
+* A published Shiny app (include your URL as a submission comment).  Follow instructions *exactly* in the YouTube video https://www.youtube.com/watch?v=LozOoIq0RjE 
+
+* Upload your .R file
+
+* A Word document containing:
+  - A short introductory paragraph that summarizes the purpose of the app (finding relatively obscure movie recommendations)
+  - A short technical summary / user manual that includes *annotated* screenshots that describes how to use the app and how to interpret the output.  By "technical summary", you do not need to go into detail about *how* the recommendation engine works per se, but rather describe what each bit of input on the app allows the user to do (a screenshot of the UI component and a description of each input, and an additional screenshot that shows example output and what each column gives, will suffice)
+  - Screenshots of the output for the 4 graded cases.  See sanity checks on Canvas.
+  - An example that is relevant to you! Choose 4-8 of your favorite movies (or more!) and put them in there. Tweak the parameters so that it gives you 5-10 recommendations. Screenshot that!
+
+
+## An additional useful line of code for the movie's case:
+
+In past semesters, some people working on the recommendation engine have noticed that the UI fails to load completely (being "stuck" on the dropdown box for the movies selection) without having any errors in the code. I've been able to reproduce the issue and to find a workaround (though it remains unclear to me why code that *should* work) ends up not working.
+
+Specifically, the selectizeInput needs adjustment.
+
+If you have:
+
+  selectizeInput(inputId="movies",
+      label="What movies do you like?",
+      choices = POPULARITY$title,
+      multiple = TRUE),
+
+and this doesn't work (there's nothing wrong with the code), here's what to change.
+
+BEFORE the ui <- fluidPage() part, but AFTER the load(" "), add in the following line:
+
+valid.choices <- sort( POPULARITY$title[ which(POPULARITY$PercentSeen > 0.5) ] )
+
+Then in the choices= argument for selectizeInput have choices=valid.choices.
+
+My hunch is that POPULARITY$title doesn't work because there are 30,000+ values and Shiny just can't populate the drop-down menu with that many choices. By defining valid.choices to be only those movies that have been seen by at least 0.5% of people, you reduce the number of movies in the drop down menu down to about 3000 or so. Then it magically works. The recommendations made are unchanged, it's just preventing the user from selecting really obscure movies on which the recommendations will be based on (which is ok, since there wouldn't be enough data to recommend a set of rare movies based on a list of super rare movies a user likes).
